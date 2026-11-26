@@ -1,0 +1,41 @@
+# Re-runs the failed jobs of a run on GitHub-hosted runners when they failed on the notebook.
+# Callers trigger it from workflow_run (the second attempt picks GitHub-hosted via github.run_attempt):
+#
+#   on:
+#     workflow_run:
+#       workflows: [CI]
+#       types: [completed]
+#   permissions:
+#     actions: write
+#   jobs:
+#     rerun:
+#       uses: guhcostan/ci-fallback/.github/workflows/rerun.yml@main
+name: rerun-on-github
+
+on:
+  workflow_call:
+
+jobs:
+  rerun:
+    if: >-
+      github.event.workflow_run.run_attempt == 1 &&
+      contains(fromJSON('["failure","timed_out","startup_failure"]'), github.event.workflow_run.conclusion)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          failed=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/attempts/1/jobs" \
+            --jq '.jobs[] | select((.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") and (.labels | index("self-hosted"))) | .name')
+          if [ -z "$failed" ]; then
+            echo "No job failed on the notebook; nothing to fall back."
+            exit 0
+          fi
+          echo "Failed on the notebook:"; echo "$failed"
+          gh run rerun "$RUN_ID" --failed -R "$REPO"
+          echo "Re-running failed jobs on GitHub-hosted runners."

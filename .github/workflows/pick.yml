@@ -1,0 +1,54 @@
+# Decides whether the caller's jobs run on the self-hosted notebook or on GitHub-hosted runners.
+#
+#   jobs:
+#     pick:
+#       uses: guhcostan/ci-fallback/.github/workflows/pick.yml@main
+#     build:
+#       needs: pick
+#       runs-on: ${{ needs.pick.outputs.local == 'true' && github.run_attempt == '1' && fromJSON('["self-hosted","macOS","ARM64"]') || 'ubuntu-latest' }}
+#
+# local=true only when the notebook heartbeat is fresh and the event is not a PR from a fork
+# (fork PRs on public repos must never run on the notebook).
+name: pick-runner
+
+on:
+  workflow_call:
+    inputs:
+      max-age:
+        description: Seconds after which the notebook heartbeat counts as stale
+        type: number
+        default: 150
+    outputs:
+      local:
+        description: "'true' when jobs should run on the self-hosted notebook"
+        value: ${{ jobs.pick.outputs.local }}
+
+permissions: {}
+
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      local: ${{ steps.pick.outputs.local }}
+    steps:
+      - id: pick
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          MAX_AGE: ${{ inputs.max-age }}
+          HEARTBEAT_URL: https://gist.githubusercontent.com/guhcostan/2bb2e6b71187826dccbf96447e5a1494/raw/heartbeat.json
+        run: |
+          local=false
+          if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+            echo "PR from fork $HEAD_REPO -> GitHub-hosted"
+          else
+            ts=$(curl -fsS --max-time 10 "$HEARTBEAT_URL?t=$(date +%s%N)" | jq -r '.ts // 0' 2>/dev/null || echo 0)
+            age=$(( $(date +%s) - ${ts:-0} ))
+            if [ "$age" -le "$MAX_AGE" ]; then
+              local=true
+              echo "notebook online (heartbeat ${age}s ago) -> self-hosted"
+            else
+              echo "notebook offline (heartbeat ${age}s ago) -> GitHub-hosted"
+            fi
+          fi
+          echo "local=$local" >> "$GITHUB_OUTPUT"
