@@ -52,6 +52,10 @@ jobs:
           def jobs(path):
               return [job for page in api(path, '--paginate', '--slurp') for job in page['jobs']]
 
+          def result_key(job):
+              # GitHub carries untouched results forward with a new check/job ID and attempt.
+              return (job['name'], job['runner_id'], job['started_at'], job['completed_at'], job['conclusion'])
+
           def cancellation(job):
               check_id = int(job['check_run_url'].rsplit('/', 1)[-1])
               pages = api(f'{repo}/check-runs/{check_id}/annotations?per_page=100', '--paginate', '--slurp')
@@ -72,16 +76,19 @@ jobs:
               raise SystemExit(0)
 
           latest = jobs(f'{run_path}/jobs?filter=latest&per_page=100')
-          cancelled = {job['id']: cancellation(job) for job in latest if job['conclusion'] == 'cancelled'}
+          first = latest if attempt == 1 else jobs(f'{run_path}/attempts/1/jobs?per_page=100')
+          original = {result_key(job): job for job in first}
+          results = {result_key(job): job for job in latest} | original
+          cancelled = {key: cancellation(job) for key, job in results.items() if job['conclusion'] == 'cancelled'}
           if 'intentional' in cancelled.values():
               print('GitHub reports a manual or concurrency cancellation.')
               raise SystemExit(0)
 
-          eligible = [job for job in latest if job['run_attempt'] == 1 and 'self-hosted' in job['labels'] and
-                      (job['conclusion'] in ('failure', 'timed_out') or cancelled.get(job['id']) == 'timeout')]
+          eligible = [job for job in latest if result_key(job) in original and 'self-hosted' in job['labels'] and
+                      (job['conclusion'] in ('failure', 'timed_out') or cancelled.get(result_key(job)) == 'timeout')]
           if attempt == 1 and current['conclusion'] == 'cancelled':
               # A cancelled run needs positive timeout evidence from a notebook job.
-              if not any(job['conclusion'] == 'timed_out' or cancelled.get(job['id']) == 'timeout' for job in eligible):
+              if not any(job['conclusion'] == 'timed_out' or cancelled.get(result_key(job)) == 'timeout' for job in eligible):
                   print('The cancelled run has no confirmed notebook timeout.')
                   raise SystemExit(0)
           if not eligible:
@@ -93,7 +100,7 @@ jobs:
               endpoint = f'{run_path}/rerun-failed-jobs'
           else:
               # GitHub accepts one targeted retry per attempt. The next completion checks
-              # only jobs whose latest result still belongs to attempt 1.
+              # only jobs whose first result was carried forward without executing again.
               job_id = min(job['id'] for job in eligible)
               endpoint = f'{repo}/actions/jobs/{job_id}/rerun'
               print(f'Retrying notebook job {job_id}.')
