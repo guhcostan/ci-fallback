@@ -79,6 +79,11 @@ jobs:
 
           eligible = [job for job in latest if job['run_attempt'] == 1 and 'self-hosted' in job['labels'] and
                       (job['conclusion'] in ('failure', 'timed_out') or cancelled.get(job['id']) == 'timeout')]
+          if attempt == 1 and current['conclusion'] == 'cancelled':
+              # A cancelled run needs positive timeout evidence from a notebook job.
+              if not any(job['conclusion'] == 'timed_out' or cancelled.get(job['id']) == 'timeout' for job in eligible):
+                  print('The cancelled run has no confirmed notebook timeout.')
+                  raise SystemExit(0)
           if not eligible:
               print('No notebook failure or confirmed timeout needs a retry.')
               raise SystemExit(0)
