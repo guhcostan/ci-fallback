@@ -54,5 +54,9 @@ Jobs inherit the daemon's `PATH` (see the plist): Homebrew, the system paths and
 `~/.ci-fallback/bin`. Symlink extra CLIs that jobs need there (e.g. `ln -s "$(command -v aws)" ~/.ci-fallback/bin/`)
 instead of adding a personal bin directory.
 
+Each slot's runner gets its own `HOME` (`~/.ci-fallback/slots/<n>/_home`): symlinks to everything in
+the real home, except `~/setup-pnpm`, which each slot keeps to itself so `pnpm/action-setup` in parallel
+jobs doesn't install over another job's pnpm. Add more such entries with `SLOT_PRIVATE` (comma-separated).
+
 Jobs that ran on the notebook and *timed out* (`timeout-minutes`) end as `cancelled`, which
 `rerun.yml` doesn't retry (it can't tell them from manual or concurrency cancels).
