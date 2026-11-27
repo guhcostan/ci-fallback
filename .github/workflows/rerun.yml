@@ -1,5 +1,5 @@
-# Re-runs the failed jobs of a run on GitHub-hosted runners when they failed on the notebook.
-# Callers trigger it from workflow_run (the second attempt picks GitHub-hosted via github.run_attempt):
+# Re-runs notebook failures and confirmed timeouts on GitHub-hosted runners.
+# Callers trigger it from workflow_run (later attempts pick GitHub-hosted via github.run_attempt):
 #
 #   on:
 #     workflow_run:
@@ -7,6 +7,7 @@
 #       types: [completed]
 #   permissions:
 #     actions: write
+#     checks: read
 #   jobs:
 #     rerun:
 #       uses: guhcostan/ci-fallback/.github/workflows/rerun.yml@main
@@ -18,24 +19,79 @@ on:
 jobs:
   rerun:
     if: >-
-      github.event.workflow_run.run_attempt == 1 &&
-      contains(fromJSON('["failure","timed_out","startup_failure"]'), github.event.workflow_run.conclusion)
+      (github.event.workflow_run.run_attempt == 1 &&
+      contains(fromJSON('["failure","timed_out","startup_failure","cancelled"]'), github.event.workflow_run.conclusion)) ||
+      (github.event.workflow_run.run_attempt > 1 && github.event.workflow_run.triggering_actor.login == 'github-actions[bot]')
+    concurrency:
+      group: ci-fallback-${{ github.event.workflow_run.id }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
     permissions:
       actions: write
+      checks: read
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        shell: python
         run: |
-          failed=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/attempts/1/jobs" \
-            --jq '.jobs[] | select((.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") and (.labels | index("self-hosted"))) | .name')
-          if [ -z "$failed" ]; then
-            echo "No job failed on the notebook; nothing to fall back."
-            exit 0
-          fi
-          echo "Failed on the notebook:"; echo "$failed"
-          gh run rerun "$RUN_ID" --failed -R "$REPO"
-          echo "Re-running failed jobs on GitHub-hosted runners."
+          import json
+          import os
+          import re
+          import subprocess
+
+          repo = f"repos/{os.environ['REPO']}"
+          run_path = f"{repo}/actions/runs/{os.environ['RUN_ID']}"
+          attempt = int(os.environ['ATTEMPT'])
+
+          def api(path, *args):
+              return json.loads(subprocess.check_output(['gh', 'api', path, *args], text=True))
+
+          def jobs(path):
+              return [job for page in api(path, '--paginate', '--slurp') for job in page['jobs']]
+
+          def cancellation(job):
+              check_id = int(job['check_run_url'].rsplit('/', 1)[-1])
+              pages = api(f'{repo}/check-runs/{check_id}/annotations?per_page=100', '--paginate', '--slurp')
+              messages = [entry['message'] for page in pages for entry in page
+                          if entry['annotation_level'] == 'failure' and entry['path'] == '.github']
+              if any(message.startswith(('The run was canceled by @', 'The job was canceled by @',
+                                         'Canceling since a higher priority waiting request'))
+                     for message in messages):
+                  return 'intentional'
+              if any(re.fullmatch(r'The job(?: running on runner .+)? has exceeded the maximum execution time(?: of [0-9hms]+)?\.?',
+                                  message) for message in messages):
+                  return 'timeout'
+              return 'unknown'
+
+          current = api(run_path)
+          if current['status'] != 'completed' or current['run_attempt'] != attempt:
+              print('The run has already advanced.')
+              raise SystemExit(0)
+
+          latest = jobs(f'{run_path}/jobs?filter=latest&per_page=100')
+          cancelled = {job['id']: cancellation(job) for job in latest if job['conclusion'] == 'cancelled'}
+          if 'intentional' in cancelled.values():
+              print('GitHub reports a manual or concurrency cancellation.')
+              raise SystemExit(0)
+
+          eligible = [job for job in latest if job['run_attempt'] == 1 and 'self-hosted' in job['labels'] and
+                      (job['conclusion'] in ('failure', 'timed_out') or cancelled.get(job['id']) == 'timeout')]
+          if not eligible:
+              print('No notebook failure or confirmed timeout needs a retry.')
+              raise SystemExit(0)
+
+          if attempt == 1 and all(reason == 'timeout' for reason in cancelled.values()):
+              # This endpoint includes cancelled jobs. Use it only when every cancellation is a timeout.
+              endpoint = f'{run_path}/rerun-failed-jobs'
+          else:
+              # GitHub accepts one targeted retry per attempt. The next completion checks
+              # only jobs whose latest result still belongs to attempt 1.
+              job_id = min(job['id'] for job in eligible)
+              endpoint = f'{repo}/actions/jobs/{job_id}/rerun'
+              print(f'Retrying notebook job {job_id}.')
+
+          subprocess.run(['gh', 'api', '--method', 'POST', endpoint], check=True)
+          print('Requested fallback to GitHub-hosted runners.')
