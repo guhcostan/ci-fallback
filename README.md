@@ -49,3 +49,10 @@ tail -f ~/.ci-fallback/logs/daemon.log
 ```
 
 Uses `gh auth token` for the API (needs `repo` and `gist` scopes).
+
+Jobs inherit the daemon's `PATH` (see the plist): Homebrew, the system paths and
+`~/.ci-fallback/bin`. Symlink extra CLIs that jobs need there (e.g. `ln -s "$(command -v aws)" ~/.ci-fallback/bin/`)
+instead of adding a personal bin directory.
+
+Jobs that ran on the notebook and *timed out* (`timeout-minutes`) end as `cancelled`, which
+`rerun.yml` doesn't retry (it can't tell them from manual or concurrency cancels).
