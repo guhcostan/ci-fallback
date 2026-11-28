@@ -9,13 +9,9 @@
 - Every HEARTBEAT seconds it writes {"ts": <unix time>} to the heartbeat gist, which the
   `pick` reusable workflow reads to decide notebook vs GitHub-hosted.
 - Idle JIT runners that never got a job (e.g. the job was cancelled) are removed after IDLE_TTL.
-- Each slot's runner gets its own HOME (<slot>/_home) that mirrors the real home through symlinks,
-  except for the entries in SLOT_PRIVATE. Actions that install into `~` (pnpm/action-setup's
-  ~/setup-pnpm) then get one copy per slot, so parallel jobs stop overwriting each other's install.
 
 Config via env: CI_FALLBACK_HOME (default ~/.ci-fallback), RUNNER_BASE (~/actions-runner),
-GIST_ID, MAX_SLOTS (4), POLL (15), LABELS (self-hosted,macOS,ARM64),
-SLOT_PRIVATE (setup-pnpm: comma-separated home entries each slot keeps to itself).
+GIST_ID, MAX_SLOTS (4), POLL (15), LABELS (self-hosted,macOS,ARM64).
 """
 import json
 import os
@@ -39,8 +35,6 @@ HEARTBEAT = 60
 IDLE_TTL = 600
 REPOS_RELOAD = 300
 LABELS = os.environ.get("LABELS", "self-hosted,macOS,ARM64").split(",")
-REAL_HOME = os.path.expanduser("~")
-SLOT_PRIVATE = {n for n in os.environ.get("SLOT_PRIVATE", "setup-pnpm").split(",") if n}
 def _host():
     try:
         return subprocess.check_output(["scutil", "--get", "LocalHostName"], text=True).strip()
@@ -126,27 +120,6 @@ class Slot:
                 elif os.path.exists(p):
                     os.remove(p)
 
-    def prepare_home(self):
-        """Point every entry of the real home into <slot>/_home, except SLOT_PRIVATE.
-
-        Run before each job, so entries created in the real home since the last job show up too.
-        Files a job writes at the top of its home stay in the slot; anything under a symlinked
-        entry (Library, .npm, .cache, ...) still lands in the real home, as before.
-        """
-        home = os.path.join(self.dir, "_home")
-        os.makedirs(home, exist_ok=True)
-        for name in os.listdir(home):
-            p = os.path.join(home, name)
-            if os.path.islink(p) and (name in SLOT_PRIVATE or not os.path.lexists(os.path.join(REAL_HOME, name))):
-                os.remove(p)
-        for name in os.listdir(REAL_HOME):
-            if name in SLOT_PRIVATE:
-                continue
-            p = os.path.join(home, name)
-            if not os.path.lexists(p):
-                os.symlink(os.path.join(REAL_HOME, name), p)
-        return home
-
     @property
     def busy(self):
         return self.proc is not None and self.proc.poll() is None
@@ -166,7 +139,6 @@ class Slot:
         self.log.flush()
         env = dict(os.environ)
         env.pop("GH_TOKEN", None)
-        env["HOME"] = self.prepare_home()
         self.proc = subprocess.Popen(
             [os.path.join(self.dir, "run.sh"), "--jitconfig", cfg["encoded_jit_config"]],
             cwd=self.dir, stdout=self.log, stderr=subprocess.STDOUT, env=env,
