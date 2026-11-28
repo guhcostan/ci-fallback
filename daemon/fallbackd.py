@@ -122,19 +122,32 @@ def _rmtree(root):
 COREPACK_SHIMS = ("pnpm", "pnpx", "yarn", "yarnpkg")
 
 
-def remove_corepack_shims(tool_dir):
-    """Undo `corepack enable` in cached Node installs: <tool_dir>/node/<ver>/<arch>/bin/<shim>."""
+def remove_corepack_shims(slot_dir):
+    """Undo `corepack enable` in the slot's cached Nodes: _work/_tool/node/<ver>/<arch>/bin/<shim>.
+
+    Every directory from the slot down to bin/ must be a real directory (no symlink), and must
+    resolve inside the slot, so this can never delete anything outside it.
+    """
     removed = []
-    node_root = os.path.join(tool_dir, "node")
-    if not os.path.isdir(node_root) or os.path.islink(node_root):
-        return removed
+    root = os.path.realpath(slot_dir)
+
+    def real_dir_inside(path):
+        return (not os.path.islink(path) and os.path.isdir(path)
+                and os.path.commonpath([root, os.path.realpath(path)]) == root)
+
+    node_root = slot_dir
+    for part in ("_work", "_tool", "node"):
+        node_root = os.path.join(node_root, part)
+        if not real_dir_inside(node_root):
+            return removed
     for version in os.listdir(node_root):
         vdir = os.path.join(node_root, version)
-        if os.path.islink(vdir) or not os.path.isdir(vdir):
+        if not real_dir_inside(vdir):
             continue
         for arch in os.listdir(vdir):
-            bindir = os.path.join(vdir, arch, "bin")
-            if os.path.islink(os.path.join(vdir, arch)) or os.path.islink(bindir) or not os.path.isdir(bindir):
+            adir = os.path.join(vdir, arch)
+            bindir = os.path.join(adir, "bin")
+            if not (real_dir_inside(adir) and real_dir_inside(bindir)):
                 continue
             for name in COREPACK_SHIMS:
                 p = os.path.join(bindir, name)
@@ -191,8 +204,11 @@ class Slot:
     def start(self, gh, repo, job_id):
         self.ensure_dir()
         home = self.reset_home()
-        for p in remove_corepack_shims(os.path.join(self.dir, "_work", "_tool")):
-            log("slot %d: removed corepack shim %s" % (self.index, p))
+        try:
+            for p in remove_corepack_shims(self.dir):
+                log("slot %d: removed corepack shim %s" % (self.index, p))
+        except OSError as e:  # contained: the job still runs, only with whatever shims remain
+            log("slot %d: corepack shim cleanup failed: %r" % (self.index, e))
         name = "%s-%s-%d" % (HOST, self.index, int(time.time()))
         cfg = gh.request("POST", "/repos/%s/actions/runners/generate-jitconfig" % repo, {
             "name": name,

@@ -1,4 +1,5 @@
 import os
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
@@ -102,27 +103,69 @@ class SlotHomeTest(unittest.TestCase):
 
 
 class CorepackShimTest(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        self.slot = self.root / "slot"
+        self.slot.mkdir()
+
+    def make_node(self, base, version="22.23.5"):
+        bindir = Path(base, "node", version, "arm64", "bin")
+        bindir.mkdir(parents=True)
+        for name in ("node", "npm"):
+            (bindir / name).touch()
+        (bindir / "corepack").symlink_to("../lib/node_modules/corepack/dist/corepack.js")
+        for name in ("pnpm", "pnpx", "yarn", "yarnpkg"):
+            (bindir / name).symlink_to("../lib/node_modules/corepack/dist/%s.js" % name)
+        return bindir
+
     def test_removes_only_corepack_shims(self):
-        with tempfile.TemporaryDirectory() as d:
-            bindir = Path(d, "node/22.23.5/arm64/bin")
-            bindir.mkdir(parents=True)
-            for name in ("node", "npm"):
-                (bindir / name).touch()
-            (bindir / "corepack").symlink_to("../lib/node_modules/corepack/dist/corepack.js")
-            for name in ("pnpm", "pnpx", "yarn", "yarnpkg"):
-                (bindir / name).symlink_to("../lib/node_modules/corepack/dist/%s.js" % name)
-            other = Path(d, "node/20.0.0/arm64/bin")
-            other.mkdir(parents=True)
-            (other / "pnpm").symlink_to("../lib/node_modules/pnpm/bin/pnpm.cjs")
+        bindir = self.make_node(self.slot / "_work/_tool")
+        other = Path(self.slot, "_work/_tool/node/20.0.0/arm64/bin")
+        other.mkdir(parents=True)
+        (other / "pnpm").symlink_to("../lib/node_modules/pnpm/bin/pnpm.cjs")
 
-            removed = fallbackd.remove_corepack_shims(d)
+        removed = fallbackd.remove_corepack_shims(str(self.slot))
 
-            self.assertEqual(len(removed), 4)
-            self.assertEqual(sorted(p.name for p in bindir.iterdir()), ["corepack", "node", "npm"])
-            self.assertTrue((other / "pnpm").is_symlink())
+        self.assertEqual(len(removed), 4)
+        self.assertEqual(sorted(p.name for p in bindir.iterdir()), ["corepack", "node", "npm"])
+        self.assertTrue((other / "pnpm").is_symlink())
 
     def test_missing_tool_dir(self):
-        self.assertEqual(fallbackd.remove_corepack_shims("/nonexistent/_tool"), [])
+        self.assertEqual(fallbackd.remove_corepack_shims(str(self.slot)), [])
+
+    def test_never_follows_symlinks_out_of_the_slot(self):
+        outside = self.root / "outside"
+        bindir = self.make_node(outside / "_tool")
+        cases = [
+            ("_work", outside),                               # _work -> outside
+            ("_work/_tool", outside / "_tool"),               # _tool -> outside
+            ("_work/_tool/node", outside / "_tool/node"),     # node -> outside
+            ("_work/_tool/node/22.23.5", outside / "_tool/node/22.23.5"),
+            ("_work/_tool/node/22.23.5/arm64", outside / "_tool/node/22.23.5/arm64"),
+            ("_work/_tool/node/22.23.5/arm64/bin", bindir),
+        ]
+        for link, target in cases:
+            with self.subTest(link=link):
+                shutil.rmtree(self.slot / "_work", ignore_errors=True)
+                if (self.slot / "_work").is_symlink():
+                    (self.slot / "_work").unlink()
+                path = self.slot / link
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.symlink_to(target, target_is_directory=True)
+
+                self.assertEqual(fallbackd.remove_corepack_shims(str(self.slot)), [])
+                self.assertTrue((bindir / "pnpm").is_symlink())
+
+    def test_cleanup_error_does_not_block_the_job(self):
+        add = SlotHomeTest("test_reused_slot_gets_a_clean_home")
+        add.setUp()
+        self.addCleanup(add.doCleanups)
+        slot = add.make_slot(1)
+        with patch.object(fallbackd, "remove_corepack_shims", side_effect=PermissionError("denied")):
+            add.start(slot)
+        add.spawn.assert_called_once()
 
 
 if __name__ == "__main__":
