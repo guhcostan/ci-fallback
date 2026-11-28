@@ -14,6 +14,10 @@
   parallel slots, and jobs don't silently pick up the owner's ~/.npmrc, ~/.aws, gh or wrangler
   logins: like on GitHub-hosted runners, credentials come only from the workflow's secrets.
   This is not a sandbox (jobs still run as this user); trust comes from the fork filter below.
+- The slot's tool cache (_work/_tool) persists between jobs, unlike on GitHub-hosted runners. A job
+  that ran `corepack enable` leaves pnpm/yarn shims in a cached Node's bin/, which then shadow the
+  pnpm that pnpm/action-setup installs (a job asking for pnpm 9 ran pnpm 11). Before each job,
+  shims that point into corepack are removed, so cached Nodes look as downloaded.
 
 Config via env: CI_FALLBACK_HOME (default ~/.ci-fallback), RUNNER_BASE (~/actions-runner),
 GIST_ID, MAX_SLOTS (4), POLL (15), LABELS (self-hosted,macOS,ARM64).
@@ -115,6 +119,31 @@ def _rmtree(root):
     shutil.rmtree(root, onerror=retry)
 
 
+COREPACK_SHIMS = ("pnpm", "pnpx", "yarn", "yarnpkg")
+
+
+def remove_corepack_shims(tool_dir):
+    """Undo `corepack enable` in cached Node installs: <tool_dir>/node/<ver>/<arch>/bin/<shim>."""
+    removed = []
+    node_root = os.path.join(tool_dir, "node")
+    if not os.path.isdir(node_root) or os.path.islink(node_root):
+        return removed
+    for version in os.listdir(node_root):
+        vdir = os.path.join(node_root, version)
+        if os.path.islink(vdir) or not os.path.isdir(vdir):
+            continue
+        for arch in os.listdir(vdir):
+            bindir = os.path.join(vdir, arch, "bin")
+            if os.path.islink(os.path.join(vdir, arch)) or os.path.islink(bindir) or not os.path.isdir(bindir):
+                continue
+            for name in COREPACK_SHIMS:
+                p = os.path.join(bindir, name)
+                if os.path.islink(p) and "corepack" in os.readlink(p).split(os.sep):
+                    os.remove(p)
+                    removed.append(p)
+    return removed
+
+
 class Slot:
     def __init__(self, index):
         self.index = index
@@ -162,6 +191,8 @@ class Slot:
     def start(self, gh, repo, job_id):
         self.ensure_dir()
         home = self.reset_home()
+        for p in remove_corepack_shims(os.path.join(self.dir, "_work", "_tool")):
+            log("slot %d: removed corepack shim %s" % (self.index, p))
         name = "%s-%s-%d" % (HOST, self.index, int(time.time()))
         cfg = gh.request("POST", "/repos/%s/actions/runners/generate-jitconfig" % repo, {
             "name": name,

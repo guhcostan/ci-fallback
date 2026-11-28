@@ -101,5 +101,29 @@ class SlotHomeTest(unittest.TestCase):
         self.assertTrue((self.home / ".ssh").is_dir())
 
 
+class CorepackShimTest(unittest.TestCase):
+    def test_removes_only_corepack_shims(self):
+        with tempfile.TemporaryDirectory() as d:
+            bindir = Path(d, "node/22.23.5/arm64/bin")
+            bindir.mkdir(parents=True)
+            for name in ("node", "npm"):
+                (bindir / name).touch()
+            (bindir / "corepack").symlink_to("../lib/node_modules/corepack/dist/corepack.js")
+            for name in ("pnpm", "pnpx", "yarn", "yarnpkg"):
+                (bindir / name).symlink_to("../lib/node_modules/corepack/dist/%s.js" % name)
+            other = Path(d, "node/20.0.0/arm64/bin")
+            other.mkdir(parents=True)
+            (other / "pnpm").symlink_to("../lib/node_modules/pnpm/bin/pnpm.cjs")
+
+            removed = fallbackd.remove_corepack_shims(d)
+
+            self.assertEqual(len(removed), 4)
+            self.assertEqual(sorted(p.name for p in bindir.iterdir()), ["corepack", "node", "npm"])
+            self.assertTrue((other / "pnpm").is_symlink())
+
+    def test_missing_tool_dir(self):
+        self.assertEqual(fallbackd.remove_corepack_shims("/nonexistent/_tool"), [])
+
+
 if __name__ == "__main__":
     unittest.main()
