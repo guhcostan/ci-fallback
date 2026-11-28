@@ -14,6 +14,10 @@
   parallel slots, and jobs don't silently pick up the owner's ~/.npmrc, ~/.aws, gh or wrangler
   logins: like on GitHub-hosted runners, credentials come only from the workflow's secrets.
   This is not a sandbox (jobs still run as this user); trust comes from the fork filter below.
+- The slot's tool cache (_work/_tool) persists between jobs, unlike on GitHub-hosted runners. A job
+  that ran `corepack enable` leaves pnpm/yarn shims in a cached Node's bin/, which then shadow the
+  pnpm that pnpm/action-setup installs (a job asking for pnpm 9 ran pnpm 11). Before each job,
+  shims that point into corepack are removed, so cached Nodes look as downloaded.
 
 Config via env: CI_FALLBACK_HOME (default ~/.ci-fallback), RUNNER_BASE (~/actions-runner),
 GIST_ID, MAX_SLOTS (4), POLL (15), LABELS (self-hosted,macOS,ARM64).
@@ -115,6 +119,44 @@ def _rmtree(root):
     shutil.rmtree(root, onerror=retry)
 
 
+COREPACK_SHIMS = ("pnpm", "pnpx", "yarn", "yarnpkg")
+
+
+def remove_corepack_shims(slot_dir):
+    """Undo `corepack enable` in the slot's cached Nodes: _work/_tool/node/<ver>/<arch>/bin/<shim>.
+
+    Every directory from the slot down to bin/ must be a real directory (no symlink), and must
+    resolve inside the slot, so this can never delete anything outside it.
+    """
+    removed = []
+    root = os.path.realpath(slot_dir)
+
+    def real_dir_inside(path):
+        return (not os.path.islink(path) and os.path.isdir(path)
+                and os.path.commonpath([root, os.path.realpath(path)]) == root)
+
+    node_root = slot_dir
+    for part in ("_work", "_tool", "node"):
+        node_root = os.path.join(node_root, part)
+        if not real_dir_inside(node_root):
+            return removed
+    for version in os.listdir(node_root):
+        vdir = os.path.join(node_root, version)
+        if not real_dir_inside(vdir):
+            continue
+        for arch in os.listdir(vdir):
+            adir = os.path.join(vdir, arch)
+            bindir = os.path.join(adir, "bin")
+            if not (real_dir_inside(adir) and real_dir_inside(bindir)):
+                continue
+            for name in COREPACK_SHIMS:
+                p = os.path.join(bindir, name)
+                if os.path.islink(p) and "corepack" in os.readlink(p).split(os.sep):
+                    os.remove(p)
+                    removed.append(p)
+    return removed
+
+
 class Slot:
     def __init__(self, index):
         self.index = index
@@ -162,6 +204,11 @@ class Slot:
     def start(self, gh, repo, job_id):
         self.ensure_dir()
         home = self.reset_home()
+        try:
+            for p in remove_corepack_shims(self.dir):
+                log("slot %d: removed corepack shim %s" % (self.index, p))
+        except OSError as e:  # contained: the job still runs, only with whatever shims remain
+            log("slot %d: corepack shim cleanup failed: %r" % (self.index, e))
         name = "%s-%s-%d" % (HOST, self.index, int(time.time()))
         cfg = gh.request("POST", "/repos/%s/actions/runners/generate-jitconfig" % repo, {
             "name": name,
