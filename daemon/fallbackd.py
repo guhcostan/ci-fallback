@@ -9,6 +9,11 @@
 - Every HEARTBEAT seconds it writes {"ts": <unix time>} to the heartbeat gist, which the
   `pick` reusable workflow reads to decide notebook vs GitHub-hosted.
 - Idle JIT runners that never got a job (e.g. the job was cancelled) are removed after IDLE_TTL.
+- Each runner gets its own empty HOME (<slot>/_home, mode 0700), wiped before and after every
+  job. Actions that install into `~` (pnpm/action-setup's ~/setup-pnpm) then can't collide across
+  parallel slots, and jobs don't silently pick up the owner's ~/.npmrc, ~/.aws, gh or wrangler
+  logins: like on GitHub-hosted runners, credentials come only from the workflow's secrets.
+  This is not a sandbox (jobs still run as this user); trust comes from the fork filter below.
 
 Config via env: CI_FALLBACK_HOME (default ~/.ci-fallback), RUNNER_BASE (~/actions-runner),
 GIST_ID, MAX_SLOTS (4), POLL (15), LABELS (self-hosted,macOS,ARM64).
@@ -96,6 +101,20 @@ class GitHub:
             raise
 
 
+def _rmtree(root):
+    """rmtree that also clears read-only trees jobs leave behind (e.g. Go's module cache).
+
+    Only ever chmods real directories inside root; symlinks are removed, never followed.
+    """
+    def retry(func, path, exc_info):
+        for p in (os.path.dirname(path), path):
+            inside = os.path.commonpath([root, p]) == root
+            if inside and not os.path.islink(p) and os.path.isdir(p):
+                os.chmod(p, 0o700)
+        func(path)
+    shutil.rmtree(root, onerror=retry)
+
+
 class Slot:
     def __init__(self, index):
         self.index = index
@@ -121,11 +140,28 @@ class Slot:
                     os.remove(p)
 
     @property
+    def home(self):
+        return os.path.join(self.dir, "_home")
+
+    def reset_home(self, create=True):
+        """Empty this slot's private HOME. Refuses a symlinked HOME instead of following it."""
+        home = self.home
+        if os.path.islink(home):
+            raise OSError("slot %d: %s is a symlink, refusing to use it" % (self.index, home))
+        if os.path.lexists(home):
+            _rmtree(home)
+        if create:
+            os.mkdir(home, 0o700)
+            os.chmod(home, 0o700)
+        return home
+
+    @property
     def busy(self):
         return self.proc is not None and self.proc.poll() is None
 
     def start(self, gh, repo, job_id):
         self.ensure_dir()
+        home = self.reset_home()
         name = "%s-%s-%d" % (HOST, self.index, int(time.time()))
         cfg = gh.request("POST", "/repos/%s/actions/runners/generate-jitconfig" % repo, {
             "name": name,
@@ -139,6 +175,7 @@ class Slot:
         self.log.flush()
         env = dict(os.environ)
         env.pop("GH_TOKEN", None)
+        env["HOME"] = home
         self.proc = subprocess.Popen(
             [os.path.join(self.dir, "run.sh"), "--jitconfig", cfg["encoded_jit_config"]],
             cwd=self.dir, stdout=self.log, stderr=subprocess.STDOUT, env=env,
@@ -155,6 +192,10 @@ class Slot:
             if self.log:
                 self.log.close()
                 self.log = None
+            try:
+                self.reset_home(create=False)
+            except OSError as e:
+                log("slot %d: could not clean home: %r" % (self.index, e))
 
     def check_idle(self, gh):
         """Drop a runner that has waited IDLE_TTL without getting a job."""

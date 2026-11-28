@@ -55,6 +55,13 @@ Jobs inherit the daemon's `PATH` (see the plist): Homebrew, the system paths and
 `~/.ci-fallback/bin`. Symlink extra CLIs that jobs need there (e.g. `ln -s "$(command -v aws)" ~/.ci-fallback/bin/`)
 instead of adding a personal bin directory.
 
+Each slot's runner gets its own empty `HOME` (`~/.ci-fallback/slots/<n>/_home`, mode 0700),
+wiped before and after every job. So parallel jobs can't clobber each other's `~/setup-pnpm`
+(pnpm/action-setup), and jobs don't pick up your `~/.npmrc`, `~/.aws`, `gh` or `wrangler`
+logins: as on GitHub-hosted runners, credentials come only from the workflow's secrets. Tools
+that cache under `~` (pnpm, Maestro, CocoaPods) download again per job. This is not a sandbox:
+jobs still run as your user, and only same-repo (non-fork) runs are picked up.
+
 GitHub can report a job that exceeds `timeout-minutes` as `cancelled`. For a cancelled job,
 `rerun.yml` reads its check annotations and requires GitHub's maximum-execution-time message.
 Manual and concurrency cancellations are terminal. The notebook daemon only provisions runners.
